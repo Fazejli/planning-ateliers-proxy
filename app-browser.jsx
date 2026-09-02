@@ -34,8 +34,6 @@ async function airtableGetAll(table, params) {
 }
 
 async function airtableCreateMany(table, fieldsArray) {
-  // L'API Airtable accepte jusqu'à 10 enregistrements par appel — largement suffisant
-  // ici (max 4, une série mensuelle).
   const body = { records: fieldsArray.map((fields) => ({ fields })) };
   const data = await airtableRequest(table, { method: "POST", body });
   return data.records;
@@ -63,7 +61,6 @@ async function airtableDeleteMany(table, ids) {
 // ---------------------------------------------------------------------------
 // Constantes métier
 // ---------------------------------------------------------------------------
-const STORAGE_KEY = "data"; // ne sert plus qu'aux jours fermés / comptes / journal (pas encore dans Airtable)
 const CAPACITY = 18;
 const WEEKDAY_NAMES = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"];
 const MONTHS_FR = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
@@ -77,17 +74,11 @@ const STATUT_COLORS = {
   "inscrit": { bg: "#E4EFE8", fg: "#3F6B52" },
   "sans suite": { bg: "#F1EDE5", fg: "#8A8371" },
 };
-
-const ZONE_C_2026_2027 = [
-  { label: "Vacances de la Toussaint", start: "2026-10-17", end: "2026-11-01" },
-  { label: "Armistice (11 novembre)", start: "2026-11-11", end: "2026-11-11" },
-  { label: "Vacances de Noël", start: "2026-12-19", end: "2027-01-03" },
-  { label: "Vacances d'hiver (zone C)", start: "2027-02-06", end: "2027-02-21" },
-  { label: "Lundi de Pâques", start: "2027-03-29", end: "2027-03-29" },
-  { label: "Vacances de printemps (zone C)", start: "2027-04-03", end: "2027-04-18" },
-  { label: "Ascension (pont)", start: "2027-05-06", end: "2027-05-07" },
-  { label: "Vacances d'été", start: "2027-07-03", end: "2027-08-31" },
-];
+// Abonnement A = 1 jour/semaine, Abonnement B = 2 jours/semaine. C'est un garde-fou côté
+// interface uniquement (Airtable stocke toujours les jours via eleve-jour-lundi..samedi) —
+// il n'existe pas de champ "type d'abonnement" séparé dans Airtable, cf. décision précédente
+// ("le nombre de jours cochés EST l'abonnement").
+const ABONNEMENT_MAX_JOURS = { A: 1, B: 2 };
 
 function uid(prefix) {
   return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -122,15 +113,6 @@ function weekDatesForIso(iso) {
   const monday = getMonday(new Date(iso + "T00:00:00"));
   return Array.from({ length: 6 }, (_, i) => isoDate(addDays(monday, i)));
 }
-function findClosedEntry(iso, closedPeriods) {
-  return closedPeriods.find((cp) => iso >= cp.start && iso <= cp.end) || null;
-}
-function formatRange(start, end) {
-  const s = new Date(start + "T00:00:00");
-  const e = new Date(end + "T00:00:00");
-  if (start === end) return shortLabel(s);
-  return `${shortLabel(s)} → ${shortLabel(e)}`;
-}
 
 const emptyBookingDraft = (presetDate, presetCreneauId) => ({
   assignmentId: null,
@@ -149,6 +131,8 @@ const emptyBookingDraft = (presetDate, presetCreneauId) => ({
   newNom: "",
   newPhone: "",
   newEmail: "",
+  newAbonnementType: "A",
+  newJours: [],
 });
 
 const emptyRosterDraft = () => ({
@@ -157,12 +141,12 @@ const emptyRosterDraft = () => ({
   nom: "",
   phone: "",
   email: "",
+  abonnementType: "A",
   joursAbonnement: [],
   status: "À rappeler",
 });
 
 const REASON_LABELS = {
-  ferme: (r) => `ignoré — fermé (${r})`,
   complet: () => "ignoré — créneau complet",
   quota: () => "ignoré — quota d'abonnement atteint cette semaine-là",
   doublon: () => "déjà inscrit(e) sur ce créneau",
@@ -176,13 +160,8 @@ function App() {
   const [roster, setRoster] = useState([]);
   const [assignments, setAssignments] = useState([]);
 
-  const [closedPeriods, setClosedPeriods] = useState([]);
-  const [accounts, setAccounts] = useState([]);
-  const [activityLog, setActivityLog] = useState([]);
-  const [currentAccountId, setCurrentAccountId] = useState(null);
-
   const [monday, setMonday] = useState(getMonday(new Date()));
-  const [view, setView] = useState("planning"); // planning | roster | closed | accounts
+  const [view, setView] = useState("planning"); // planning | roster
   const [search, setSearch] = useState("");
   const [rosterFilter, setRosterFilter] = useState("tous");
   const [rosterSearch, setRosterSearch] = useState("");
@@ -198,15 +177,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [creneauError, setCreneauError] = useState({});
 
-  const [closedForm, setClosedForm] = useState({ label: "", start: "", end: "" });
-  const [closedError, setClosedError] = useState("");
-
-  const [accountModal, setAccountModal] = useState(null);
-  const [accountError, setAccountError] = useState("");
-
   const [confirmDeleteRoster, setConfirmDeleteRoster] = useState(null);
-  const [confirmDeleteClosed, setConfirmDeleteClosed] = useState(null);
-  const [confirmDeleteAccount, setConfirmDeleteAccount] = useState(null);
 
   const weekDates = useMemo(() => Array.from({ length: 6 }, (_, i) => addDays(monday, i)), [monday]);
   const weekIsoSet = useMemo(() => new Set(weekDates.map(isoDate)), [weekDates]);
@@ -219,7 +190,16 @@ function App() {
     records.forEach((rec) => {
       const day = rec.fields["Jour"];
       if (!byDay[day]) return;
-      byDay[day].push({ id: rec.id, horaire: rec.fields["Horaire"] || "" });
+      byDay[day].push({
+        id: rec.id,
+        horaire: rec.fields["Horaire"] || "",
+        tuteurs: {
+          "Groupe 1": rec.fields["Tuteur Groupe 1"] || "",
+          "Groupe 2": rec.fields["Tuteur Groupe 2"] || "",
+          "Groupe 3": rec.fields["Tuteur Groupe 3"] || "",
+          "Groupe 4": rec.fields["Tuteur Groupe 4"] || "",
+        },
+      });
     });
     Object.keys(byDay).forEach((d) => byDay[d].sort((a, b) => a.horaire.localeCompare(b.horaire)));
     setCreneauxByDay(byDay);
@@ -280,53 +260,11 @@ function App() {
       } catch (e) {
         console.error("Échec du chargement depuis Airtable", e);
         setApiError(e.message || "Impossible de charger les données depuis Airtable.");
-      }
-      // Jours fermés / comptes / journal : pas encore de table Airtable dédiée, restent en local.
-      try {
-        const res = await window.storage.get(STORAGE_KEY, true);
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          if (parsed.closedPeriods) setClosedPeriods(parsed.closedPeriods);
-          if (parsed.accounts) setAccounts(parsed.accounts);
-          if (parsed.activityLog) setActivityLog(parsed.activityLog);
-        }
-      } catch (e) {
-        // pas encore de données locales
-      }
-      try {
-        const personal = await window.storage.get("current-account", false);
-        if (personal && personal.value) setCurrentAccountId(personal.value);
-      } catch (e) {
-        // pas encore choisi
       } finally {
         setLoaded(true);
       }
     })();
   }, [refreshAll]);
-
-  const persistLocal = useCallback(async (data) => {
-    try {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(data), true);
-    } catch (e) {
-      console.error("Échec de la sauvegarde locale", e);
-    }
-  }, []);
-
-  const setActiveAccount = (id) => {
-    setCurrentAccountId(id);
-    window.storage.set("current-account", id || "", false).catch(() => {});
-  };
-
-  const accountsById = useMemo(() => {
-    const map = {};
-    accounts.forEach((a) => (map[a.id] = a));
-    return map;
-  }, [accounts]);
-
-  const currentAccountName = accountsById[currentAccountId]?.name || null;
-
-  const logAction = (text) =>
-    [{ id: uid("log"), ts: new Date().toISOString(), who: currentAccountName || "Non identifié", text }, ...activityLog].slice(0, 50);
 
   const rosterById = useMemo(() => {
     const map = {};
@@ -357,7 +295,7 @@ function App() {
 
   const weeklyCountForRoster = (rosterId, excludeAssignmentId) => weeklyCountInWeekOf(rosterId, isoDate(monday), excludeAssignmentId);
 
-  // --- occupation de la semaine affichée (pour le rendu) ---
+  // --- occupation de la semaine affichée (regroupée par groupe de travail, pour le rendu) ---
   const occupancy = useMemo(() => {
     const map = {};
     weekDates.forEach((d) => {
@@ -382,18 +320,7 @@ function App() {
     return map;
   }, [assignments, weekDates, rosterById, creneauxByDay]);
 
-  const closedByIso = useMemo(() => {
-    const map = {};
-    weekDates.forEach((d) => {
-      const iso = isoDate(d);
-      map[iso] = findClosedEntry(iso, closedPeriods);
-    });
-    return map;
-  }, [weekDates, closedPeriods]);
-
   const totalCapacity = weekDates.reduce((sum, d) => {
-    const iso = isoDate(d);
-    if (closedByIso[iso]) return sum;
     const wd = WEEKDAY_NAMES[d.getDay() - 1];
     return sum + (creneauxByDay[wd] || []).length * CAPACITY;
   }, 0);
@@ -442,32 +369,71 @@ function App() {
     return roster.filter((r) => r.name.toLowerCase().includes(q)).slice(0, 6);
   }, [booking, roster]);
 
+  // Si le jour déjà présélectionné (via "+ Inscrire ici" sur un créneau précis) ne correspond
+  // à aucun jour d'abonnement de l'élève choisi, on le réinitialise pour forcer un choix valide —
+  // c'est le garde-fou qui empêche de réserver un élève sur un jour qu'il n'a pas souscrit.
   const selectRosterForBooking = (rosterId) => {
-    setBooking((b) => ({ ...b, rosterId, query: rosterById[rosterId]?.name || b.query, creatingNew: false }));
+    const student = rosterById[rosterId];
+    setBooking((b) => {
+      const allowed = !b.date || !student || student.joursAbonnement.includes(weekdayNameForDate(b.date));
+      return {
+        ...b,
+        rosterId,
+        query: student ? student.name : b.query,
+        creatingNew: false,
+        date: allowed ? b.date : "",
+        creneauId: allowed ? b.creneauId : null,
+      };
+    });
     setBookingError("");
   };
 
   const startCreatingNewFromBooking = () => setBooking((b) => ({ ...b, creatingNew: true, newPrenom: b.query, newNom: "" }));
+
+  const setNewAbonnementType = (type) => {
+    setBooking((b) => ({ ...b, newAbonnementType: type, newJours: b.newJours.slice(0, ABONNEMENT_MAX_JOURS[type]) }));
+  };
+
+  const toggleNewJour = (day) => {
+    setBooking((b) => {
+      const max = ABONNEMENT_MAX_JOURS[b.newAbonnementType];
+      const has = b.newJours.includes(day);
+      if (has) return { ...b, newJours: b.newJours.filter((x) => x !== day) };
+      if (b.newJours.length >= max) return b;
+      return { ...b, newJours: [...b.newJours, day] };
+    });
+  };
 
   const confirmCreateFromBooking = async () => {
     if (!booking.newPrenom.trim() || !booking.newNom.trim()) {
       setBookingError("Merci d'indiquer le prénom et le nom du nouvel élève.");
       return;
     }
+    if (booking.newJours.length === 0) {
+      setBookingError("Choisissez au moins un jour d'abonnement pour ce nouvel élève.");
+      return;
+    }
+    const fields = {
+      "eleve-prenom": booking.newPrenom.trim(),
+      "eleve-nom": booking.newNom.trim(),
+      "parent-telephone": booking.newPhone.trim() || undefined,
+      "parent-email": booking.newEmail.trim() || undefined,
+      statut: "À rappeler",
+    };
+    WEEKDAY_NAMES.forEach((d) => {
+      fields[`eleve-jour-${d.toLowerCase()}`] = booking.newJours.includes(d) ? "true" : "false";
+    });
     try {
-      const record = await airtableCreate("eleves", {
-        "eleve-prenom": booking.newPrenom.trim(),
-        "eleve-nom": booking.newNom.trim(),
-        "parent-telephone": booking.newPhone.trim() || undefined,
-        "parent-email": booking.newEmail.trim() || undefined,
-        statut: "À rappeler",
-      });
+      const record = await airtableCreate("eleves", fields);
       await refreshRoster();
+      const allowed = !booking.date || booking.newJours.includes(weekdayNameForDate(booking.date));
       setBooking((b) => ({
         ...b,
         rosterId: record.id,
         query: `${booking.newPrenom.trim()} ${booking.newNom.trim()}`,
         creatingNew: false,
+        date: allowed ? b.date : "",
+        creneauId: allowed ? b.creneauId : null,
       }));
       setBookingError("");
     } catch (e) {
@@ -484,11 +450,6 @@ function App() {
 
     RECURRENCE_OFFSETS.forEach((offset) => {
       const targetDate = isoDate(addDays(new Date(booking.date + "T00:00:00"), offset));
-      const closed = findClosedEntry(targetDate, closedPeriods);
-      if (closed) {
-        results.push({ date: targetDate, ok: false, reason: REASON_LABELS.ferme(closed.label) });
-        return;
-      }
       const dup = simulated.some((a) => a.rosterId === booking.rosterId && a.date === targetDate && a.creneauId === booking.creneauId);
       if (dup) {
         results.push({ date: targetDate, ok: false, reason: REASON_LABELS.doublon() });
@@ -526,11 +487,6 @@ function App() {
             Groupe: booking.groupe || undefined,
           }))
         );
-        const nextLog = logAction(
-          `Inscription créée — ${student ? student.name : "?"} — ${weekdayNameForDate(booking.date)} (${toCreate.length}/4 semaines)`
-        );
-        setActivityLog(nextLog);
-        persistLocal({ closedPeriods, accounts, activityLog: nextLog });
         await refreshReservations();
       } catch (e) {
         setBookingError("Échec de l'enregistrement : " + e.message);
@@ -563,14 +519,8 @@ function App() {
   };
 
   const removeSingleBooking = async () => {
-    const student = rosterById[booking.rosterId];
     try {
       await airtableDelete("reservations", booking.assignmentId);
-      const nextLog = logAction(
-        `Créneau retiré (une occurrence) — ${student ? student.name : "?"} — ${weekdayNameForDate(booking.originalDate)} ${shortLabel(new Date(booking.originalDate + "T00:00:00"))}`
-      );
-      setActivityLog(nextLog);
-      persistLocal({ closedPeriods, accounts, activityLog: nextLog });
       await refreshReservations();
     } catch (e) {
       setBookingError("Échec de la suppression : " + e.message);
@@ -581,15 +531,9 @@ function App() {
   };
 
   const removeSeriesFromHere = async () => {
-    const student = rosterById[booking.rosterId];
     const toRemove = assignments.filter((a) => a.seriesId && a.seriesId === booking.seriesId && a.date >= booking.originalDate);
     try {
       await airtableDeleteMany("reservations", toRemove.map((a) => a.id));
-      const nextLog = logAction(
-        `Créneau retiré (à partir de cette semaine) — ${student ? student.name : "?"} — depuis ${weekdayNameForDate(booking.originalDate)} ${shortLabel(new Date(booking.originalDate + "T00:00:00"))} (${booking.seriesFutureCount} semaine(s))`
-      );
-      setActivityLog(nextLog);
-      persistLocal({ closedPeriods, accounts, activityLog: nextLog });
       await refreshReservations();
     } catch (e) {
       setBookingError("Échec de la suppression : " + e.message);
@@ -612,11 +556,26 @@ function App() {
       nom: r.nom,
       phone: r.phone,
       email: r.email,
+      abonnementType: r.joursAbonnement.length >= 2 ? "B" : "A",
       joursAbonnement: r.joursAbonnement,
       status: r.status,
     });
   };
   const closeRosterModal = () => setRosterModal(null);
+
+  const setRosterAbonnementType = (type) => {
+    setRosterModal((m) => ({ ...m, abonnementType: type, joursAbonnement: m.joursAbonnement.slice(0, ABONNEMENT_MAX_JOURS[type]) }));
+  };
+
+  const toggleRosterJour = (day) => {
+    setRosterModal((m) => {
+      const max = ABONNEMENT_MAX_JOURS[m.abonnementType];
+      const has = m.joursAbonnement.includes(day);
+      if (has) return { ...m, joursAbonnement: m.joursAbonnement.filter((x) => x !== day) };
+      if (m.joursAbonnement.length >= max) return m;
+      return { ...m, joursAbonnement: [...m.joursAbonnement, day] };
+    });
+  };
 
   const saveRosterModal = async () => {
     if (!rosterModal.prenom.trim() || !rosterModal.nom.trim()) {
@@ -652,14 +611,10 @@ function App() {
       setTimeout(() => setConfirmDeleteRoster((cur) => (cur === id ? null : cur)), 3000);
       return;
     }
-    const student = rosterById[id];
     const linked = assignments.filter((a) => a.rosterId === id);
     try {
       await airtableDeleteMany("reservations", linked.map((a) => a.id));
       await airtableDelete("eleves", id);
-      const nextLog = logAction(`Fiche élève supprimée — ${student ? student.name : id}`);
-      setActivityLog(nextLog);
-      persistLocal({ closedPeriods, accounts, activityLog: nextLog });
       await Promise.all([refreshRoster(), refreshReservations()]);
     } catch (e) {
       console.error(e);
@@ -667,47 +622,7 @@ function App() {
     setConfirmDeleteRoster(null);
   };
 
-  // --- comptes (équipe / accountability — reste en local pour l'instant) ---
-  const openNewAccount = () => {
-    setAccountError("");
-    setAccountModal({ editingId: null, name: "", role: "Animateur" });
-  };
-  const openEditAccount = (acc) => {
-    setAccountError("");
-    setAccountModal({ editingId: acc.id, name: acc.name, role: acc.role });
-  };
-  const closeAccountModal = () => setAccountModal(null);
-
-  const saveAccountModal = () => {
-    if (!accountModal.name.trim()) {
-      setAccountError("Merci d'indiquer un nom.");
-      return;
-    }
-    let next;
-    if (accountModal.editingId) {
-      next = accounts.map((a) => (a.id === accountModal.editingId ? { ...a, name: accountModal.name.trim(), role: accountModal.role } : a));
-    } else {
-      next = [...accounts, { id: uid("acc"), name: accountModal.name.trim(), role: accountModal.role }];
-    }
-    setAccounts(next);
-    persistLocal({ closedPeriods, accounts: next, activityLog });
-    setAccountModal(null);
-  };
-
-  const deleteAccount = (id) => {
-    if (confirmDeleteAccount !== id) {
-      setConfirmDeleteAccount(id);
-      setTimeout(() => setConfirmDeleteAccount((cur) => (cur === id ? null : cur)), 3000);
-      return;
-    }
-    const next = accounts.filter((a) => a.id !== id);
-    setAccounts(next);
-    if (currentAccountId === id) setActiveAccount(null);
-    persistLocal({ closedPeriods, accounts: next, activityLog });
-    setConfirmDeleteAccount(null);
-  };
-
-  // --- créneaux (CRUD Airtable — remplace l'ancien "Renommer les horaires" en local) ---
+  // --- créneaux (CRUD Airtable — en direct, chaque modification est immédiate) ---
   const openSettings = () => {
     setCreneauError({});
     setSettingsOpen(true);
@@ -716,6 +631,16 @@ function App() {
   const renameCreneau = async (creneauId, newHoraire) => {
     try {
       await airtableUpdate("creneaux", creneauId, { Horaire: newHoraire });
+      await refreshCreneaux();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const updateCreneauTuteur = async (creneauId, groupe, newTuteur) => {
+    const fieldName = `Tuteur ${groupe}`;
+    try {
+      await airtableUpdate("creneaux", creneauId, { [fieldName]: newTuteur });
       await refreshCreneaux();
     } catch (e) {
       console.error(e);
@@ -731,9 +656,8 @@ function App() {
     }
   };
 
-  // Contrairement à l'ancienne version (array local), n'importe quel créneau peut être retiré,
-  // pas seulement le dernier — puisque chaque créneau est un vrai enregistrement Airtable identifié
-  // par son id, il n'y a plus de risque de décalage/renumérotation.
+  // Contrairement à un système par position numérique, n'importe quel créneau peut être retiré
+  // (pas seulement le dernier) puisqu'il est identifié par son id Airtable, pas par sa place.
   const removeCreneau = async (day, creneauId) => {
     const blockers = assignments.filter((a) => a.creneauId === creneauId);
     if (blockers.length > 0) {
@@ -751,50 +675,6 @@ function App() {
     } catch (e) {
       setCreneauError((prev) => ({ ...prev, [day]: "Échec de la suppression : " + e.message }));
     }
-  };
-
-  // --- jours fermés (reste en local pour l'instant) ---
-  const addClosedPeriod = () => {
-    if (!closedForm.label.trim()) {
-      setClosedError("Merci d'indiquer un libellé (ex. « Vacances de la Toussaint »).");
-      return;
-    }
-    if (!closedForm.start) {
-      setClosedError("Merci de choisir au moins une date de début.");
-      return;
-    }
-    const start = closedForm.start;
-    const end = closedForm.end || closedForm.start;
-    if (end < start) {
-      setClosedError("La date de fin doit être après la date de début.");
-      return;
-    }
-    const next = [...closedPeriods, { id: uid("c"), label: closedForm.label.trim(), start, end }];
-    setClosedPeriods(next);
-    persistLocal({ closedPeriods: next, accounts, activityLog });
-    setClosedForm({ label: "", start: "", end: "" });
-    setClosedError("");
-  };
-
-  const deleteClosedPeriod = (id) => {
-    if (confirmDeleteClosed !== id) {
-      setConfirmDeleteClosed(id);
-      setTimeout(() => setConfirmDeleteClosed((cur) => (cur === id ? null : cur)), 3000);
-      return;
-    }
-    const next = closedPeriods.filter((c) => c.id !== id);
-    setClosedPeriods(next);
-    persistLocal({ closedPeriods: next, accounts, activityLog });
-    setConfirmDeleteClosed(null);
-  };
-
-  const addPresetHolidays = () => {
-    const existingKeys = new Set(closedPeriods.map((c) => `${c.label}|${c.start}`));
-    const toAdd = ZONE_C_2026_2027.filter((h) => !existingKeys.has(`${h.label}|${h.start}`)).map((h) => ({ id: uid("c"), ...h }));
-    if (toAdd.length === 0) return;
-    const next = [...closedPeriods, ...toAdd];
-    setClosedPeriods(next);
-    persistLocal({ closedPeriods: next, accounts, activityLog });
   };
 
   const weekRoster = useMemo(() => {
@@ -830,6 +710,42 @@ function App() {
     );
   };
 
+  // Petit sélecteur réutilisé (fiche élève + création rapide depuis la réservation) :
+  // type d'abonnement A/B, qui limite le nombre de jours sélectionnables.
+  const AbonnementPicker = ({ type, jours, onType, onToggleJour }) => (
+    <>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        {["A", "B"].map((t) => (
+          <button
+            key={t}
+            className="pa-btn"
+            onClick={() => onType(t)}
+            style={{ flex: 1, padding: "9px 8px", fontSize: 13, background: type === t ? "#1F2A38" : "#EFECE2", color: type === t ? "#fff" : "#1F2A38" }}
+          >
+            Abonnement {t} ({ABONNEMENT_MAX_JOURS[t]} jour{ABONNEMENT_MAX_JOURS[t] > 1 ? "s" : ""}/sem.)
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {WEEKDAY_NAMES.map((d) => {
+          const active = jours.includes(d);
+          const disabled = !active && jours.length >= ABONNEMENT_MAX_JOURS[type];
+          return (
+            <button
+              key={d}
+              className="pa-btn"
+              onClick={() => onToggleJour(d)}
+              disabled={disabled}
+              style={{ padding: "7px 11px", fontSize: 12.5, background: active ? "#3F6B52" : "#EFECE2", color: active ? "#fff" : "#1F2A38" }}
+            >
+              {d}
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
+
   return (
     <div style={{ background: "#F5F3ED", minHeight: "100%", padding: "28px 24px 60px" }}>
       <style>{`
@@ -856,6 +772,7 @@ function App() {
         .pa-tab { padding: 8px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; border: none; }
         .pa-match { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; cursor: pointer; border: 1px solid #E4E0D5; background: #FEFDFB; margin-bottom: 6px; }
         .pa-match:hover { border-color: #3F6B52; }
+        .pa-group-block { border: 1px solid #EFECE2; border-radius: 9px; padding: 8px; margin-bottom: 6px; }
       `}</style>
 
       <div className="pa-root">
@@ -875,17 +792,6 @@ function App() {
             </p>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <select
-              className="pa-select"
-              value={currentAccountId || ""}
-              onChange={(e) => setActiveAccount(e.target.value || null)}
-              style={{ width: "auto", maxWidth: 200, fontSize: 13, padding: "9px 10px" }}
-            >
-              <option value="">Connecté en tant que…</option>
-              {accounts.map((a) => (
-                <option key={a.id} value={a.id}>{a.name} ({a.role})</option>
-              ))}
-            </select>
             <button className="pa-btn" onClick={openSettings} style={{ background: "#EFECE2", color: "#1F2A38", padding: "10px 16px", fontSize: 14 }}>
               Gérer les créneaux
             </button>
@@ -902,12 +808,6 @@ function App() {
           </button>
           <button className="pa-tab" onClick={() => setView("roster")} style={{ background: view === "roster" ? "#1F2A38" : "#EFECE2", color: view === "roster" ? "#fff" : "#1F2A38" }}>
             Base élèves
-          </button>
-          <button className="pa-tab" onClick={() => setView("closed")} style={{ background: view === "closed" ? "#1F2A38" : "#EFECE2", color: view === "closed" ? "#fff" : "#1F2A38" }}>
-            Jours fermés{closedPeriods.length > 0 ? ` (${closedPeriods.length})` : ""}
-          </button>
-          <button className="pa-tab" onClick={() => setView("accounts")} style={{ background: view === "accounts" ? "#1F2A38" : "#EFECE2", color: view === "accounts" ? "#fff" : "#1F2A38" }}>
-            Comptes{accounts.length > 0 ? ` (${accounts.length})` : ""}
           </button>
         </div>
 
@@ -927,46 +827,16 @@ function App() {
             </div>
 
             <p style={{ fontSize: 12.5, color: "#8A8371", marginTop: -14, marginBottom: 18 }}>
-              Une nouvelle inscription se répète automatiquement sur 4 semaines (un mois d'abonnement).
+              Une nouvelle inscription se répète automatiquement sur 4 semaines, sur le même jour et le même créneau (un mois d'abonnement).
             </p>
 
-            <div style={{ display: "grid", gridTemplateColumns: `repeat(${weekDates.length}, minmax(160px, 1fr))`, gap: 12, overflowX: "auto", marginBottom: 34 }}>
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${weekDates.length}, minmax(180px, 1fr))`, gap: 12, overflowX: "auto", marginBottom: 34 }}>
               {weekDates.map((date) => {
                 const iso = isoDate(date);
                 const wd = WEEKDAY_NAMES[date.getDay() - 1];
                 const dayCreneaux = creneauxByDay[wd] || [];
                 const dayTotal = dayCreneaux.length * CAPACITY;
                 const dayOccupied = Object.values(occupancy[iso] || {}).reduce((s, list) => s + list.length, 0);
-                const closedEntry = closedByIso[iso];
-
-                if (closedEntry) {
-                  const strandedBookings = Object.values(occupancy[iso] || {}).flat();
-                  return (
-                    <div key={iso} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                      <div style={{ padding: "2px 4px" }}>
-                        <div className="pa-display" style={{ fontSize: 16.5, fontWeight: 600, color: "#1F2A38" }}>
-                          {wd} <span style={{ fontWeight: 500, color: "#8A8371", fontSize: 13.5 }}>{shortLabel(date)}</span>
-                        </div>
-                      </div>
-                      <div className="pa-card" style={{ padding: 12, borderTop: "3px solid #B3462F", background: "#FBF6F2" }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: "#B3462F", marginBottom: 4 }}>Fermé</div>
-                        <div style={{ fontSize: 12.5, color: "#6B6455" }}>{closedEntry.label}</div>
-                        {strandedBookings.length > 0 && (
-                          <div style={{ marginTop: 10 }}>
-                            <div style={{ fontSize: 11.5, color: "#B3462F", fontWeight: 600, marginBottom: 6 }}>À déplacer :</div>
-                            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                              {strandedBookings.map((s) => (
-                                <span key={s.assignmentId} className="pa-chip" onClick={() => openEditBooking(s.assignmentId)} style={{ background: "#fff", color: "#1F2A38", borderColor: "#E4C9BE" }}>
-                                  {s.name}
-                                </span>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                }
 
                 return (
                   <div key={iso} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -982,6 +852,13 @@ function App() {
                       const ratio = count / CAPACITY;
                       const full = count >= CAPACITY;
                       const accent = full ? "#B3462F" : ratio >= 0.75 ? "#C98A2C" : "#3F6B52";
+                      const byGroupe = {};
+                      GROUPES.forEach((g) => (byGroupe[g] = []));
+                      const sansGroupe = [];
+                      occ.forEach((s) => {
+                        if (s.groupe && byGroupe[s.groupe]) byGroupe[s.groupe].push(s);
+                        else sansGroupe.push(s);
+                      });
                       return (
                         <div key={c.id} className="pa-card" style={{ padding: 12, borderTop: `3px solid ${accent}` }}>
                           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
@@ -991,28 +868,46 @@ function App() {
                           <div style={{ height: 5, background: "#EFECE2", borderRadius: 4, overflow: "hidden", marginBottom: 10 }}>
                             <div style={{ height: "100%", width: `${Math.min(ratio, 1) * 100}%`, background: accent }} />
                           </div>
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 5, minHeight: 4 }}>
-                            {occ.map((s) => (
-                              <span
-                                key={s.assignmentId}
-                                className="pa-chip"
-                                onClick={() => openEditBooking(s.assignmentId)}
-                                style={{ background: "#F5F3ED", color: "#1F2A38" }}
-                                title="Modifier cette réservation"
-                              >
-                                {s.name}
-                                {s.formula === 2 && <span style={{ color: "#8A8371" }}>·2</span>}
-                                {s.groupe && <span style={{ color: "#8A8371" }}> · {s.groupe}</span>}
-                                {s.activite && <span style={{ color: "#8A8371" }}> · {s.activite}</span>}
-                              </span>
-                            ))}
-                          </div>
+
+                          {GROUPES.map((g) => (
+                            <div key={g} className="pa-group-block">
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: byGroupe[g].length ? 6 : 0 }}>
+                                <span style={{ fontSize: 11.5, fontWeight: 700, color: "#6B6455" }}>{g}</span>
+                                <span style={{ fontSize: 11, color: "#8A8371" }}>{c.tuteurs && c.tuteurs[g] ? c.tuteurs[g] : "Tuteur non assigné"}</span>
+                              </div>
+                              {byGroupe[g].length > 0 && (
+                                <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                                  {byGroupe[g].map((s) => (
+                                    <span key={s.assignmentId} className="pa-chip" onClick={() => openEditBooking(s.assignmentId)} style={{ background: "#F5F3ED", color: "#1F2A38" }} title="Modifier cette réservation">
+                                      {s.name}
+                                      {s.formula === 2 && <span style={{ color: "#8A8371" }}>·2</span>}
+                                      {s.activite && <span style={{ color: "#8A8371" }}> · {s.activite}</span>}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                          {sansGroupe.length > 0 && (
+                            <div className="pa-group-block">
+                              <div style={{ fontSize: 11.5, fontWeight: 700, color: "#6B6455", marginBottom: 6 }}>Groupe non précisé</div>
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                                {sansGroupe.map((s) => (
+                                  <span key={s.assignmentId} className="pa-chip" onClick={() => openEditBooking(s.assignmentId)} style={{ background: "#F5F3ED", color: "#1F2A38" }} title="Modifier cette réservation">
+                                    {s.name}
+                                    {s.activite && <span style={{ color: "#8A8371" }}> · {s.activite}</span>}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
                           {!full && (
-                            <button className="pa-btn" onClick={() => openBooking(iso, c.id)} style={{ marginTop: 9, background: "transparent", color: accent, fontSize: 12.5, padding: "4px 0" }}>
+                            <button className="pa-btn" onClick={() => openBooking(iso, c.id)} style={{ marginTop: 4, background: "transparent", color: accent, fontSize: 12.5, padding: "4px 0" }}>
                               + Inscrire ici
                             </button>
                           )}
-                          {full && <div style={{ marginTop: 9, fontSize: 12, color: "#B3462F", fontWeight: 600 }}>Complet</div>}
+                          {full && <div style={{ marginTop: 4, fontSize: 12, color: "#B3462F", fontWeight: 600 }}>Complet</div>}
                         </div>
                       );
                     })}
@@ -1033,7 +928,7 @@ function App() {
                   <thead>
                     <tr>
                       <th>Nom</th>
-                      <th>Formule</th>
+                      <th>Jours réservés / abonnement</th>
                       <th>Statut</th>
                       <th>Créneaux cette semaine</th>
                     </tr>
@@ -1044,7 +939,7 @@ function App() {
                       return (
                         <tr key={r.id}>
                           <td style={{ fontWeight: 600, color: "#1F2A38" }}>{r.name}</td>
-                          <td>{r.formula} créneau{r.formula > 1 ? "x" : ""} / semaine</td>
+                          <td style={{ fontWeight: 600, color: bookings.length >= r.formula ? "#3F6B52" : "#C98A2C" }}>{bookings.length}/{r.formula}</td>
                           <td><StatusBadge status={r.status} /></td>
                           <td>
                             <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
@@ -1135,150 +1030,6 @@ function App() {
           </div>
         )}
 
-        {view === "closed" && (
-          <div className="pa-card" style={{ padding: 18 }}>
-            <h2 className="pa-display" style={{ fontSize: 19, fontWeight: 600, color: "#1F2A38", margin: "0 0 4px" }}>Jours fermés</h2>
-            <p style={{ fontSize: 13, color: "#8A8371", marginTop: 0, marginBottom: 14 }}>
-              Bloquez des dates ou des périodes (vacances scolaires, jours fériés). Ces jours disparaissent de la grille de réservation ; les inscriptions déjà posées dessus restent visibles pour être déplacées. (Stocké en local pour l'instant, pas encore dans Airtable.)
-            </p>
-
-            <div className="pa-card" style={{ padding: 14, marginBottom: 16, background: "#F1EDE0", border: "1px solid #E4D9BD" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-                <div>
-                  <div style={{ fontSize: 13.5, fontWeight: 600, color: "#1F2A38" }}>Vacances scolaires zone C (Paris) 2026-2027 + jours fériés</div>
-                  <div style={{ fontSize: 12, color: "#6B6455", marginTop: 2 }}>Toussaint, Noël, hiver, printemps, été, Armistice, Lundi de Pâques, pont de l'Ascension — 8 fermetures, ajoutées en un clic.</div>
-                </div>
-                <button className="pa-btn" onClick={addPresetHolidays} style={{ background: "#1F2A38", color: "#fff", padding: "9px 16px", fontSize: 13, whiteSpace: "nowrap" }}>
-                  Ajouter le calendrier 2026-2027
-                </button>
-              </div>
-            </div>
-
-            <div className="pa-card" style={{ padding: 14, marginBottom: 20, background: "#FAF9F5" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr auto", gap: 8, alignItems: "end" }}>
-                <div>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Libellé</label>
-                  <input className="pa-input" placeholder="Ex. Vacances de la Toussaint" value={closedForm.label} onChange={(e) => setClosedForm((f) => ({ ...f, label: e.target.value }))} />
-                </div>
-                <div>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Début</label>
-                  <input className="pa-input" type="date" value={closedForm.start} onChange={(e) => setClosedForm((f) => ({ ...f, start: e.target.value }))} />
-                </div>
-                <div>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Fin (optionnel)</label>
-                  <input className="pa-input" type="date" value={closedForm.end} onChange={(e) => setClosedForm((f) => ({ ...f, end: e.target.value }))} />
-                </div>
-                <button className="pa-btn" onClick={addClosedPeriod} style={{ background: "#3F6B52", color: "#fff", padding: "9px 14px", fontSize: 13.5 }}>
-                  Ajouter
-                </button>
-              </div>
-              {closedError && <div style={{ background: "#FBEAE4", color: "#B3462F", fontSize: 12.5, padding: "8px 10px", borderRadius: 6, marginTop: 10 }}>{closedError}</div>}
-            </div>
-
-            {closedPeriods.length === 0 ? (
-              <p style={{ color: "#8A8371", fontSize: 14, padding: "4px" }}>Aucun jour fermé pour l'instant.</p>
-            ) : (
-              <table className="pa-table" style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th>Libellé</th>
-                    <th>Dates</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[...closedPeriods]
-                    .sort((a, b) => a.start.localeCompare(b.start))
-                    .map((c) => (
-                      <tr key={c.id}>
-                        <td style={{ fontWeight: 600, color: "#1F2A38" }}>{c.label}</td>
-                        <td>{formatRange(c.start, c.end)}</td>
-                        <td>
-                          <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                            <button
-                              className="pa-btn"
-                              onClick={() => deleteClosedPeriod(c.id)}
-                              style={{ background: confirmDeleteClosed === c.id ? "#B3462F" : "#F5F3ED", color: confirmDeleteClosed === c.id ? "#fff" : "#B3462F", padding: "6px 11px", fontSize: 12.5 }}
-                            >
-                              {confirmDeleteClosed === c.id ? "Confirmer ?" : "Supprimer"}
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        )}
-
-        {view === "accounts" && (
-          <div className="pa-card" style={{ padding: 18 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
-              <h2 className="pa-display" style={{ fontSize: 19, fontWeight: 600, color: "#1F2A38", margin: 0 }}>Comptes de l'équipe</h2>
-              <button className="pa-btn" onClick={openNewAccount} style={{ background: "#3F6B52", color: "#fff", padding: "9px 15px", fontSize: 13.5 }}>
-                + Nouveau compte
-              </button>
-            </div>
-            <p style={{ fontSize: 13, color: "#8A8371", marginTop: 0, marginBottom: 18 }}>
-              Ajoutez les membres de l'équipe qui gèrent le planning. Chacun choisit son nom en haut de la page (« Connecté en tant que ») pour que les actions importantes soient tracées ci-dessous. (Stocké en local pour l'instant, pas encore dans Airtable.)
-            </p>
-
-            {accounts.length === 0 ? (
-              <p style={{ color: "#8A8371", fontSize: 14, padding: "4px" }}>Aucun compte pour l'instant.</p>
-            ) : (
-              <table className="pa-table" style={{ width: "100%", borderCollapse: "collapse", marginBottom: 24 }}>
-                <thead>
-                  <tr>
-                    <th>Nom</th>
-                    <th>Rôle</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {accounts.map((a) => (
-                    <tr key={a.id}>
-                      <td style={{ fontWeight: 600, color: "#1F2A38" }}>
-                        {a.name}
-                        {currentAccountId === a.id && <span style={{ marginLeft: 8, fontSize: 11, color: "#3F6B52", fontWeight: 600 }}>· vous</span>}
-                      </td>
-                      <td>{a.role}</td>
-                      <td>
-                        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                          <button className="pa-btn" onClick={() => openEditAccount(a)} style={{ background: "#EFECE2", color: "#1F2A38", padding: "6px 11px", fontSize: 12.5 }}>
-                            Modifier
-                          </button>
-                          <button
-                            className="pa-btn"
-                            onClick={() => deleteAccount(a.id)}
-                            style={{ background: confirmDeleteAccount === a.id ? "#B3462F" : "#F5F3ED", color: confirmDeleteAccount === a.id ? "#fff" : "#B3462F", padding: "6px 11px", fontSize: 12.5 }}
-                          >
-                            {confirmDeleteAccount === a.id ? "Confirmer ?" : "Supprimer"}
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-
-            <h3 className="pa-display" style={{ fontSize: 16, fontWeight: 600, color: "#1F2A38", margin: "0 0 10px" }}>Activité récente</h3>
-            {activityLog.length === 0 ? (
-              <p style={{ color: "#8A8371", fontSize: 14, padding: "4px" }}>Aucune action enregistrée pour l'instant.</p>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {activityLog.map((log) => (
-                  <div key={log.id} style={{ fontSize: 12.5, color: "#6B6455", padding: "8px 10px", background: "#F5F3ED", borderRadius: 7 }}>
-                    <span style={{ fontWeight: 600, color: "#1F2A38" }}>{log.who}</span> — {log.text}
-                    <span style={{ color: "#8A8371" }}> · {new Date(log.ts).toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
         <p style={{ fontSize: 12, color: "#8A8371", marginTop: 16 }}>
           Élèves, créneaux et réservations sont partagés via Airtable : toute personne de l'équipe voit et modifie les mêmes données, en temps réel.
         </p>
@@ -1334,7 +1085,9 @@ function App() {
                           <div key={r.id} className="pa-match" onClick={() => selectRosterForBooking(r.id)}>
                             <div>
                               <div style={{ fontWeight: 600, color: "#1F2A38", fontSize: 14 }}>{r.name}</div>
-                              <div style={{ fontSize: 12, color: "#8A8371" }}>{r.formula} créneau{r.formula > 1 ? "x" : ""}/sem.{r.phone ? ` · ${r.phone}` : ""}</div>
+                              <div style={{ fontSize: 12, color: "#8A8371" }}>
+                                Abonné {r.joursAbonnement.join(", ") || "aucun jour"}{r.phone ? ` · ${r.phone}` : ""}
+                              </div>
                             </div>
                             <StatusBadge status={r.status} />
                           </div>
@@ -1358,7 +1111,14 @@ function App() {
                         <input className="pa-input" placeholder="Nom" value={booking.newNom} onChange={(e) => setBooking((b) => ({ ...b, newNom: e.target.value }))} style={{ marginBottom: 8 }} />
                         <input className="pa-input" placeholder="Téléphone (optionnel)" value={booking.newPhone} onChange={(e) => setBooking((b) => ({ ...b, newPhone: e.target.value }))} style={{ marginBottom: 8 }} />
                         <input className="pa-input" placeholder="Email (optionnel)" value={booking.newEmail} onChange={(e) => setBooking((b) => ({ ...b, newEmail: e.target.value }))} style={{ marginBottom: 10 }} />
-                        <button className="pa-btn" onClick={confirmCreateFromBooking} style={{ background: "#3F6B52", color: "#fff", padding: "8px 14px", fontSize: 13, width: "100%" }}>
+                        <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6455", marginBottom: 6 }}>Abonnement</div>
+                        <AbonnementPicker
+                          type={booking.newAbonnementType}
+                          jours={booking.newJours}
+                          onType={setNewAbonnementType}
+                          onToggleJour={toggleNewJour}
+                        />
+                        <button className="pa-btn" onClick={confirmCreateFromBooking} style={{ background: "#3F6B52", color: "#fff", padding: "8px 14px", fontSize: 13, width: "100%", marginTop: 10 }}>
                           Créer et sélectionner
                         </button>
                       </div>
@@ -1372,7 +1132,7 @@ function App() {
                       <div>
                         <div style={{ fontWeight: 600, color: "#1F2A38", fontSize: 15 }}>{rosterById[booking.rosterId].name}</div>
                         <div style={{ fontSize: 12.5, color: "#8A8371", marginTop: 3 }}>
-                          {rosterById[booking.rosterId].formula} créneau{rosterById[booking.rosterId].formula > 1 ? "x" : ""}/semaine
+                          Abonné {rosterById[booking.rosterId].joursAbonnement.join(", ") || "aucun jour"}
                           {rosterById[booking.rosterId].phone ? ` · ${rosterById[booking.rosterId].phone}` : ""}
                         </div>
                         <div style={{ fontSize: 12.5, color: "#6B6455", marginTop: 3 }}>
@@ -1402,40 +1162,40 @@ function App() {
                         </div>
                       </div>
                     ) : (
-                      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-                        <select className="pa-select" value={booking.date} onChange={(e) => setBooking((b) => ({ ...b, date: e.target.value, creneauId: null }))}>
-                          <option value="">Date…</option>
-                          {weekDates.map((d) => {
-                            const iso = isoDate(d);
-                            const dwd = WEEKDAY_NAMES[d.getDay() - 1];
-                            const closedEntry = closedByIso[iso];
-                            if (closedEntry && iso !== booking.date) return null;
-                            return (
-                              <option key={iso} value={iso}>
-                                {dwd} {shortLabel(d)}{closedEntry ? ` (fermé — ${closedEntry.label})` : ""}
-                              </option>
-                            );
-                          })}
-                        </select>
-                        <select className="pa-select" value={booking.creneauId || ""} onChange={(e) => setBooking((b) => ({ ...b, creneauId: e.target.value || null }))} disabled={!booking.date}>
-                          <option value="">Créneau…</option>
-                          {booking.date &&
-                            (creneauxByDay[weekdayNameForDate(booking.date)] || []).map((c) => {
-                              const occ = countForDate(booking.date, c.id, booking.assignmentId);
-                              const disabled = occ >= CAPACITY;
-                              return (
-                                <option key={c.id} value={c.id} disabled={disabled}>
-                                  {c.horaire} — {occ}/{CAPACITY}{disabled ? " (complet)" : ""}
-                                </option>
-                              );
-                            })}
-                        </select>
-                      </div>
-                    )}
-                    {!booking.assignmentId && (
-                      <p style={{ fontSize: 12, color: "#8A8371", marginTop: -10, marginBottom: 16 }}>
-                        Sera réservé sur ce même jour et ce même créneau pendant 4 semaines, sans possibilité de changer avant le renouvellement.
-                      </p>
+                      <>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                          <select className="pa-select" value={booking.date} onChange={(e) => setBooking((b) => ({ ...b, date: e.target.value, creneauId: null }))}>
+                            <option value="">Date…</option>
+                            {weekDates
+                              .filter((d) => (rosterById[booking.rosterId]?.joursAbonnement || []).includes(WEEKDAY_NAMES[d.getDay() - 1]))
+                              .map((d) => {
+                                const iso = isoDate(d);
+                                const dwd = WEEKDAY_NAMES[d.getDay() - 1];
+                                return (
+                                  <option key={iso} value={iso}>
+                                    {dwd} {shortLabel(d)}
+                                  </option>
+                                );
+                              })}
+                          </select>
+                          <select className="pa-select" value={booking.creneauId || ""} onChange={(e) => setBooking((b) => ({ ...b, creneauId: e.target.value || null }))} disabled={!booking.date}>
+                            <option value="">Créneau…</option>
+                            {booking.date &&
+                              (creneauxByDay[weekdayNameForDate(booking.date)] || []).map((c) => {
+                                const occ = countForDate(booking.date, c.id, booking.assignmentId);
+                                const disabled = occ >= CAPACITY;
+                                return (
+                                  <option key={c.id} value={c.id} disabled={disabled}>
+                                    {c.horaire} — {occ}/{CAPACITY}{disabled ? " (complet)" : ""}
+                                  </option>
+                                );
+                              })}
+                          </select>
+                        </div>
+                        <p style={{ fontSize: 12, color: "#8A8371", marginTop: -2, marginBottom: 16 }}>
+                          Seuls les jours abonnés de cet élève sont proposés ({rosterById[booking.rosterId]?.joursAbonnement.join(", ") || "aucun"}). Réservé sur ce jour et ce créneau pendant 4 semaines, sans possibilité de changer avant le renouvellement.
+                        </p>
+                      </>
                     )}
 
                     <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Activité prévue</label>
@@ -1530,26 +1290,14 @@ function App() {
             <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Email</label>
             <input className="pa-input" value={rosterModal.email} onChange={(e) => setRosterModal((m) => ({ ...m, email: e.target.value }))} style={{ marginBottom: 14 }} />
 
-            <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Jours d'abonnement</label>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
-              {WEEKDAY_NAMES.map((d) => {
-                const active = rosterModal.joursAbonnement.includes(d);
-                return (
-                  <button
-                    key={d}
-                    className="pa-btn"
-                    onClick={() =>
-                      setRosterModal((m) => ({
-                        ...m,
-                        joursAbonnement: active ? m.joursAbonnement.filter((x) => x !== d) : [...m.joursAbonnement, d],
-                      }))
-                    }
-                    style={{ padding: "7px 11px", fontSize: 12.5, background: active ? "#3F6B52" : "#EFECE2", color: active ? "#fff" : "#1F2A38" }}
-                  >
-                    {d}
-                  </button>
-                );
-              })}
+            <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Abonnement</label>
+            <div style={{ marginBottom: 14 }}>
+              <AbonnementPicker
+                type={rosterModal.abonnementType}
+                jours={rosterModal.joursAbonnement}
+                onType={setRosterAbonnementType}
+                onToggleJour={toggleRosterJour}
+              />
             </div>
 
             <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Statut</label>
@@ -1575,51 +1323,13 @@ function App() {
         </div>
       )}
 
-      {/* Account modal */}
-      {accountModal && (
-        <div className="pa-overlay" onClick={closeAccountModal}>
-          <div className="pa-modal" onClick={(e) => e.stopPropagation()}>
-            <h3 className="pa-display" style={{ fontSize: 19, fontWeight: 600, color: "#1F2A38", marginTop: 0 }}>
-              {accountModal.editingId ? "Modifier le compte" : "Nouveau compte"}
-            </h3>
-            <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Nom</label>
-            <input className="pa-input" value={accountModal.name} onChange={(e) => setAccountModal((m) => ({ ...m, name: e.target.value }))} style={{ marginBottom: 14 }} autoFocus />
-
-            <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Rôle</label>
-            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-              {["Admin", "Animateur"].map((r) => (
-                <button
-                  key={r}
-                  className="pa-btn"
-                  onClick={() => setAccountModal((m) => ({ ...m, role: r }))}
-                  style={{ flex: 1, padding: "10px 8px", fontSize: 13.5, background: accountModal.role === r ? "#3F6B52" : "#EFECE2", color: accountModal.role === r ? "#fff" : "#1F2A38" }}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
-
-            {accountError && <div style={{ background: "#FBEAE4", color: "#B3462F", fontSize: 13, padding: "9px 11px", borderRadius: 7, marginBottom: 14 }}>{accountError}</div>}
-
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-              <button className="pa-btn" onClick={closeAccountModal} style={{ background: "#EFECE2", color: "#1F2A38", padding: "10px 16px", fontSize: 14 }}>
-                Annuler
-              </button>
-              <button className="pa-btn" onClick={saveAccountModal} style={{ background: "#3F6B52", color: "#fff", padding: "10px 18px", fontSize: 14 }}>
-                Enregistrer
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Settings modal — gestion des créneaux (Airtable, en direct) */}
       {settingsOpen && (
         <div className="pa-overlay" onClick={() => setSettingsOpen(false)}>
           <div className="pa-modal" onClick={(e) => e.stopPropagation()}>
             <h3 className="pa-display" style={{ fontSize: 19, fontWeight: 600, color: "#1F2A38", marginTop: 0 }}>Gérer les créneaux</h3>
             <p style={{ fontSize: 13, color: "#8A8371", marginTop: -6, marginBottom: 16 }}>
-              Chaque modification est enregistrée immédiatement dans Airtable. Renommez un horaire en cliquant hors du champ, ajoutez ou retirez un créneau par jour.
+              Chaque modification est enregistrée immédiatement dans Airtable. Renommez un horaire ou un tuteur en cliquant hors du champ ; ajoutez ou retirez un créneau par jour.
             </p>
             {WEEKDAY_NAMES.map((day) => (
               <div key={day} style={{ marginBottom: 14 }}>
@@ -1634,20 +1344,37 @@ function App() {
                     {creneauError[day]}
                   </div>
                 )}
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   {(creneauxByDay[day] || []).map((c) => (
-                    <div key={c.id} style={{ display: "flex", gap: 6 }}>
-                      <input
-                        className="pa-input"
-                        defaultValue={c.horaire}
-                        onBlur={(e) => {
-                          const val = e.target.value.trim();
-                          if (val && val !== c.horaire) renameCreneau(c.id, val);
-                        }}
-                      />
-                      <button className="pa-btn" onClick={() => removeCreneau(day, c.id)} style={{ background: "#F5F3ED", color: "#B3462F", padding: "8px 10px", fontSize: 12, whiteSpace: "nowrap" }}>
-                        − Retirer
-                      </button>
+                    <div key={c.id} className="pa-card" style={{ padding: 10 }}>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                        <input
+                          className="pa-input"
+                          defaultValue={c.horaire}
+                          onBlur={(e) => {
+                            const val = e.target.value.trim();
+                            if (val && val !== c.horaire) renameCreneau(c.id, val);
+                          }}
+                        />
+                        <button className="pa-btn" onClick={() => removeCreneau(day, c.id)} style={{ background: "#F5F3ED", color: "#B3462F", padding: "8px 10px", fontSize: 12, whiteSpace: "nowrap" }}>
+                          − Retirer
+                        </button>
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                        {GROUPES.map((g) => (
+                          <input
+                            key={g}
+                            className="pa-input"
+                            placeholder={`Tuteur ${g}`}
+                            defaultValue={c.tuteurs ? c.tuteurs[g] : ""}
+                            style={{ fontSize: 12.5, padding: "7px 9px" }}
+                            onBlur={(e) => {
+                              const val = e.target.value.trim();
+                              if (val !== (c.tuteurs ? c.tuteurs[g] : "")) updateCreneauTuteur(c.id, g, val);
+                            }}
+                          />
+                        ))}
+                      </div>
                     </div>
                   ))}
                   {(creneauxByDay[day] || []).length === 0 && <p style={{ fontSize: 12.5, color: "#8A8371", margin: 0 }}>Aucun créneau ce jour-là.</p>}
