@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Planning des ateliers</title>
+  <style>
+    html, body, #root { margin: 0; padding: 0; min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React + ReactDOM (production, via CDN) -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- Babel standalone : transforme le JSX directement dans le navigateur, pas besoin de build -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!--
+    IMPORTANT : window.storage (utilisé pour les jours fermés / comptes / journal, encore en local)
+    n'existe que dans l'environnement Claude.ai. Ici, en dehors de Claude, il faut un remplaçant
+    minimal pour que l'outil ne plante pas. Ce mini-polyfill stocke simplement dans le navigateur
+    (localStorage) — donc CES données-là restent propres à chaque ordinateur, pas partagées entre
+    les deux personnes de l'équipe. Si besoin de les partager un jour, il faudra les migrer vers
+    Airtable comme le reste.
+  -->
+  <script>
+    window.storage = {
+      async get(key, shared) {
+        const raw = localStorage.getItem("pa-" + key);
+        return raw ? { key, value: raw, shared: !!shared } : null;
+      },
+      async set(key, value, shared) {
+        localStorage.setItem("pa-" + key, value);
+        return { key, value, shared: !!shared };
+      },
+      async delete(key, shared) {
+        localStorage.removeItem("pa-" + key);
+        return { key, deleted: true, shared: !!shared };
+      },
+      async list(prefix) {
+        const keys = Object.keys(localStorage).filter((k) => k.startsWith("pa-" + (prefix || "")));
+        return { keys };
+      },
+    };
+  </script>
+
+  <script type="text/babel" src="app-browser.jsx"></script>
+</body>
+</html>
