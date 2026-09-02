@@ -66,7 +66,10 @@ const WEEKDAY_NAMES = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samed
 const MONTHS_FR = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
 const RECURRENCE_OFFSETS = [0, 7, 14, 21]; // un abonnement mensuel = 4 semaines
 const ACTIVITES = ["Études", "Fablab", "Codage"]; // activité prévue pour ce créneau précis
-const GROUPES = ["Groupe 1", "Groupe 2", "Groupe 3", "Groupe 4"]; // purement informatif, aucune capacité par groupe
+const GROUPES = ["Groupe 1", "Groupe 2", "Groupe 3", "Groupe 4"];
+// Capacité propre à chaque groupe (vérifiée seulement quand un groupe est effectivement choisi —
+// laisser "non précisé" ne vérifie que la capacité totale du créneau, 18).
+const GROUPE_CAPACITY = { "Groupe 1": 6, "Groupe 2": 4, "Groupe 3": 4, "Groupe 4": 4 };
 const STATUTS = ["À rappeler", "Rappelé", "Inscrit", "Sans suite"];
 const STATUT_COLORS = {
   "à rappeler": { bg: "#F1EDE0", fg: "#8A6D1F" },
@@ -148,6 +151,7 @@ const emptyRosterDraft = () => ({
 
 const REASON_LABELS = {
   complet: () => "ignoré — créneau complet",
+  groupeComplet: (g) => `ignoré — ${g} complet (${GROUPE_CAPACITY[g]} places)`,
   quota: () => "ignoré — quota d'abonnement atteint cette semaine-là",
   doublon: () => "déjà inscrit(e) sur ce créneau",
 };
@@ -285,6 +289,12 @@ function App() {
     [assignments]
   );
 
+  const countForGroupe = useCallback(
+    (iso, creneauId, groupe, excludeAssignmentId) =>
+      assignments.filter((a) => a.date === iso && a.creneauId === creneauId && a.groupe === groupe && a.id !== excludeAssignmentId).length,
+    [assignments]
+  );
+
   const weeklyCountInWeekOf = useCallback(
     (rosterId, referenceIso, excludeAssignmentId) => {
       const wset = new Set(weekDatesForIso(referenceIso));
@@ -371,21 +381,27 @@ function App() {
 
   // Si le jour déjà présélectionné (via "+ Inscrire ici" sur un créneau précis) ne correspond
   // à aucun jour d'abonnement de l'élève choisi, on le réinitialise pour forcer un choix valide —
-  // c'est le garde-fou qui empêche de réserver un élève sur un jour qu'il n'a pas souscrit.
+  // c'est le garde-fou qui empêche de réserver un élève sur un jour qu'il n'a pas souscrit. On
+  // l'explique clairement plutôt que de réinitialiser silencieusement.
   const selectRosterForBooking = (rosterId) => {
     const student = rosterById[rosterId];
-    setBooking((b) => {
-      const allowed = !b.date || !student || student.joursAbonnement.includes(weekdayNameForDate(b.date));
-      return {
-        ...b,
-        rosterId,
-        query: student ? student.name : b.query,
-        creatingNew: false,
-        date: allowed ? b.date : "",
-        creneauId: allowed ? b.creneauId : null,
-      };
-    });
-    setBookingError("");
+    const presetDay = booking?.date ? weekdayNameForDate(booking.date) : null;
+    const allowed = !presetDay || !student || student.joursAbonnement.includes(presetDay);
+    setBooking((b) => ({
+      ...b,
+      rosterId,
+      query: student ? student.name : b.query,
+      creatingNew: false,
+      date: allowed ? b.date : "",
+      creneauId: allowed ? b.creneauId : null,
+    }));
+    if (!allowed && student) {
+      setBookingError(
+        `${student.name} n'est abonné(e) que pour ${student.joursAbonnement.join(", ") || "aucun jour"} — ${presetDay} n'est pas disponible. Choisissez une autre date.`
+      );
+    } else {
+      setBookingError("");
+    }
   };
 
   const startCreatingNewFromBooking = () => setBooking((b) => ({ ...b, creatingNew: true, newPrenom: b.query, newNom: "" }));
@@ -426,7 +442,8 @@ function App() {
     try {
       const record = await airtableCreate("eleves", fields);
       await refreshRoster();
-      const allowed = !booking.date || booking.newJours.includes(weekdayNameForDate(booking.date));
+      const presetDay = booking.date ? weekdayNameForDate(booking.date) : null;
+      const allowed = !presetDay || booking.newJours.includes(presetDay);
       setBooking((b) => ({
         ...b,
         rosterId: record.id,
@@ -435,7 +452,9 @@ function App() {
         date: allowed ? b.date : "",
         creneauId: allowed ? b.creneauId : null,
       }));
-      setBookingError("");
+      setBookingError(
+        allowed ? "" : `Fiche créée — abonné(e) pour ${booking.newJours.join(", ")} — ${presetDay} n'est pas disponible. Choisissez une autre date.`
+      );
     } catch (e) {
       setBookingError("Échec de la création de la fiche élève : " + e.message);
     }
@@ -460,6 +479,13 @@ function App() {
         results.push({ date: targetDate, ok: false, reason: REASON_LABELS.complet() });
         return;
       }
+      if (booking.groupe) {
+        const capGroupe = simulated.filter((a) => a.date === targetDate && a.creneauId === booking.creneauId && a.groupe === booking.groupe).length;
+        if (capGroupe >= GROUPE_CAPACITY[booking.groupe]) {
+          results.push({ date: targetDate, ok: false, reason: REASON_LABELS.groupeComplet(booking.groupe) });
+          return;
+        }
+      }
       if (student) {
         const wset = new Set(weekDatesForIso(targetDate));
         const weeklyCount = simulated.filter((a) => a.rosterId === booking.rosterId && wset.has(a.date)).length;
@@ -468,7 +494,7 @@ function App() {
           return;
         }
       }
-      simulated.push({ id: "tmp-" + toCreate.length, rosterId: booking.rosterId, date: targetDate, creneauId: booking.creneauId });
+      simulated.push({ id: "tmp-" + toCreate.length, rosterId: booking.rosterId, date: targetDate, creneauId: booking.creneauId, groupe: booking.groupe });
       toCreate.push(targetDate);
       results.push({ date: targetDate, ok: true });
     });
@@ -505,6 +531,13 @@ function App() {
     if (sameActivite && sameGroupe) {
       setBookingError("Aucun changement à enregistrer.");
       return;
+    }
+    if (booking.groupe && !sameGroupe) {
+      const capGroupe = countForGroupe(booking.originalDate, booking.originalCreneauId, booking.groupe, booking.assignmentId);
+      if (capGroupe >= GROUPE_CAPACITY[booking.groupe]) {
+        setBookingError(`${booking.groupe} est déjà complet (${GROUPE_CAPACITY[booking.groupe]} places).`);
+        return;
+      }
     }
     try {
       await airtableUpdate("reservations", booking.assignmentId, {
@@ -869,25 +902,30 @@ function App() {
                             <div style={{ height: "100%", width: `${Math.min(ratio, 1) * 100}%`, background: accent }} />
                           </div>
 
-                          {GROUPES.map((g) => (
-                            <div key={g} className="pa-group-block">
-                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: byGroupe[g].length ? 6 : 0 }}>
-                                <span style={{ fontSize: 11.5, fontWeight: 700, color: "#6B6455" }}>{g}</span>
-                                <span style={{ fontSize: 11, color: "#8A8371" }}>{c.tuteurs && c.tuteurs[g] ? c.tuteurs[g] : "Tuteur non assigné"}</span>
-                              </div>
-                              {byGroupe[g].length > 0 && (
-                                <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                                  {byGroupe[g].map((s) => (
-                                    <span key={s.assignmentId} className="pa-chip" onClick={() => openEditBooking(s.assignmentId)} style={{ background: "#F5F3ED", color: "#1F2A38" }} title="Modifier cette réservation">
-                                      {s.name}
-                                      {s.formula === 2 && <span style={{ color: "#8A8371" }}>·2</span>}
-                                      {s.activite && <span style={{ color: "#8A8371" }}> · {s.activite}</span>}
-                                    </span>
-                                  ))}
+                          {GROUPES.map((g) => {
+                            const full = byGroupe[g].length >= GROUPE_CAPACITY[g];
+                            return (
+                              <div key={g} className="pa-group-block">
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: byGroupe[g].length ? 6 : 0 }}>
+                                  <span style={{ fontSize: 11.5, fontWeight: 700, color: full ? "#B3462F" : "#6B6455" }}>
+                                    {g} · {byGroupe[g].length}/{GROUPE_CAPACITY[g]}
+                                  </span>
+                                  <span style={{ fontSize: 11, color: "#8A8371" }}>{c.tuteurs && c.tuteurs[g] ? c.tuteurs[g] : "Tuteur non assigné"}</span>
                                 </div>
-                              )}
-                            </div>
-                          ))}
+                                {byGroupe[g].length > 0 && (
+                                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                                    {byGroupe[g].map((s) => (
+                                      <span key={s.assignmentId} className="pa-chip" onClick={() => openEditBooking(s.assignmentId)} style={{ background: "#F5F3ED", color: "#1F2A38" }} title="Modifier cette réservation">
+                                        {s.name}
+                                        {s.formula === 2 && <span style={{ color: "#8A8371" }}>·2</span>}
+                                        {s.activite && <span style={{ color: "#8A8371" }}> · {s.activite}</span>}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                           {sansGroupe.length > 0 && (
                             <div className="pa-group-block">
                               <div style={{ fontSize: 11.5, fontWeight: 700, color: "#6B6455", marginBottom: 6 }}>Groupe non précisé</div>
@@ -1208,10 +1246,18 @@ function App() {
 
                     <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Groupe de travail</label>
                     <select className="pa-select" value={booking.groupe} onChange={(e) => setBooking((b) => ({ ...b, groupe: e.target.value }))} style={{ marginBottom: 16 }}>
-                      <option value="">Non précisé</option>
-                      {GROUPES.map((g) => (
-                        <option key={g} value={g}>{g}</option>
-                      ))}
+                      <option value="">Non précisé (capacité totale du créneau uniquement)</option>
+                      {GROUPES.map((g) => {
+                        const refDate = booking.assignmentId ? booking.originalDate : booking.date;
+                        const refCreneau = booking.assignmentId ? booking.originalCreneauId : booking.creneauId;
+                        const occG = refDate && refCreneau ? countForGroupe(refDate, refCreneau, g, booking.assignmentId) : 0;
+                        const disabled = occG >= GROUPE_CAPACITY[g] && g !== booking.groupe;
+                        return (
+                          <option key={g} value={g} disabled={disabled}>
+                            {g} — {occG}/{GROUPE_CAPACITY[g]}{disabled ? " (complet)" : ""}
+                          </option>
+                        );
+                      })}
                     </select>
                   </>
                 )}
