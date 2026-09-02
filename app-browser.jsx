@@ -540,43 +540,18 @@ function App() {
     setBookingSummary(results);
   };
 
-  // Modification d'une inscription EXISTANTE : enregistrement direct
+  // Modification d'une inscription EXISTANTE : le jour et le créneau sont figés jusqu'au renouvellement
+  // (choisis une fois à la création de l'abonnement) — seuls l'activité et le groupe restent modifiables.
   const saveEditBooking = async () => {
     const original = assignments.find((a) => a.id === booking.assignmentId);
-    const sameSlot = booking.date === booking.originalDate && booking.creneauId === booking.originalCreneauId;
     const sameActivite = (booking.activite || "") === (original?.activite || "");
     const sameGroupe = (booking.groupe || "") === (original?.groupe || "");
-    if (sameSlot && sameActivite && sameGroupe) {
+    if (sameActivite && sameGroupe) {
       setBookingError("Aucun changement à enregistrer.");
-      return;
-    }
-    const closed = findClosedEntry(booking.date, closedPeriods);
-    if (closed) {
-      setBookingError(`Cette date est fermée (${closed.label}). Choisissez une autre date.`);
-      return;
-    }
-    const dup = assignments.some(
-      (a) => a.rosterId === booking.rosterId && a.date === booking.date && a.creneauId === booking.creneauId && a.id !== booking.assignmentId
-    );
-    if (dup) {
-      setBookingError("Cet élève est déjà inscrit sur ce créneau.");
-      return;
-    }
-    const cap = countForDate(booking.date, booking.creneauId, booking.assignmentId);
-    if (cap >= CAPACITY) {
-      setBookingError(`Ce créneau est complet (${CAPACITY}/${CAPACITY}).`);
-      return;
-    }
-    const student = rosterById[booking.rosterId];
-    const weeklyCount = weeklyCountInWeekOf(booking.rosterId, booking.date, booking.assignmentId);
-    if (student && weeklyCount >= student.formula) {
-      setBookingError(`${student.name} a déjà atteint son quota (${student.formula} créneau${student.formula > 1 ? "x" : ""}/semaine) sur cette semaine.`);
       return;
     }
     try {
       await airtableUpdate("reservations", booking.assignmentId, {
-        "Créneau": [booking.creneauId],
-        Date: booking.date,
         Activité: booking.activite || undefined,
         Groupe: booking.groupe || undefined,
       });
@@ -1417,38 +1392,49 @@ function App() {
                 {booking.rosterId && (
                   <>
                     <label style={{ fontSize: 13, fontWeight: 600, color: "#6B6455", display: "block", marginBottom: 5 }}>Créneau</label>
-                    <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-                      <select className="pa-select" value={booking.date} onChange={(e) => setBooking((b) => ({ ...b, date: e.target.value, creneauId: null }))}>
-                        <option value="">Date…</option>
-                        {weekDates.map((d) => {
-                          const iso = isoDate(d);
-                          const dwd = WEEKDAY_NAMES[d.getDay() - 1];
-                          const closedEntry = closedByIso[iso];
-                          if (closedEntry && iso !== booking.date) return null;
-                          return (
-                            <option key={iso} value={iso}>
-                              {dwd} {shortLabel(d)}{closedEntry ? ` (fermé — ${closedEntry.label})` : ""}
-                            </option>
-                          );
-                        })}
-                      </select>
-                      <select className="pa-select" value={booking.creneauId || ""} onChange={(e) => setBooking((b) => ({ ...b, creneauId: e.target.value || null }))} disabled={!booking.date}>
-                        <option value="">Créneau…</option>
-                        {booking.date &&
-                          (creneauxByDay[weekdayNameForDate(booking.date)] || []).map((c) => {
-                            const occ = countForDate(booking.date, c.id, booking.assignmentId);
-                            const disabled = occ >= CAPACITY;
+                    {booking.assignmentId ? (
+                      <div className="pa-card" style={{ padding: "10px 12px", marginBottom: 6, background: "#F5F3ED" }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: "#1F2A38" }}>
+                          {weekdayNameForDate(booking.originalDate)} · {creneauById[booking.originalCreneauId]?.horaire}
+                        </div>
+                        <div style={{ fontSize: 12, color: "#8A8371", marginTop: 2 }}>
+                          Figé jusqu'au renouvellement de l'abonnement — seuls l'activité et le groupe restent modifiables. Pour changer de jour, retirez cette inscription et recréez-en une nouvelle.
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+                        <select className="pa-select" value={booking.date} onChange={(e) => setBooking((b) => ({ ...b, date: e.target.value, creneauId: null }))}>
+                          <option value="">Date…</option>
+                          {weekDates.map((d) => {
+                            const iso = isoDate(d);
+                            const dwd = WEEKDAY_NAMES[d.getDay() - 1];
+                            const closedEntry = closedByIso[iso];
+                            if (closedEntry && iso !== booking.date) return null;
                             return (
-                              <option key={c.id} value={c.id} disabled={disabled}>
-                                {c.horaire} — {occ}/{CAPACITY}{disabled ? " (complet)" : ""}
+                              <option key={iso} value={iso}>
+                                {dwd} {shortLabel(d)}{closedEntry ? ` (fermé — ${closedEntry.label})` : ""}
                               </option>
                             );
                           })}
-                      </select>
-                    </div>
+                        </select>
+                        <select className="pa-select" value={booking.creneauId || ""} onChange={(e) => setBooking((b) => ({ ...b, creneauId: e.target.value || null }))} disabled={!booking.date}>
+                          <option value="">Créneau…</option>
+                          {booking.date &&
+                            (creneauxByDay[weekdayNameForDate(booking.date)] || []).map((c) => {
+                              const occ = countForDate(booking.date, c.id, booking.assignmentId);
+                              const disabled = occ >= CAPACITY;
+                              return (
+                                <option key={c.id} value={c.id} disabled={disabled}>
+                                  {c.horaire} — {occ}/{CAPACITY}{disabled ? " (complet)" : ""}
+                                </option>
+                              );
+                            })}
+                        </select>
+                      </div>
+                    )}
                     {!booking.assignmentId && (
                       <p style={{ fontSize: 12, color: "#8A8371", marginTop: -10, marginBottom: 16 }}>
-                        Sera aussi réservé les 3 semaines suivantes, sur le même jour et le même créneau.
+                        Sera réservé sur ce même jour et ce même créneau pendant 4 semaines, sans possibilité de changer avant le renouvellement.
                       </p>
                     )}
 

@@ -17,14 +17,7 @@
   <!-- Babel standalone : transforme le JSX directement dans le navigateur, pas besoin de build -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <!--
-    IMPORTANT : window.storage (utilisé pour les jours fermés / comptes / journal, encore en local)
-    n'existe que dans l'environnement Claude.ai. Ici, en dehors de Claude, il faut un remplaçant
-    minimal pour que l'outil ne plante pas. Ce mini-polyfill stocke simplement dans le navigateur
-    (localStorage) — donc CES données-là restent propres à chaque ordinateur, pas partagées entre
-    les deux personnes de l'équipe. Si besoin de les partager un jour, il faudra les migrer vers
-    Airtable comme le reste.
-  -->
+
   <script>
     window.storage = {
       async get(key, shared) {
